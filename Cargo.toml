@@ -1,0 +1,23 @@
+[package]
+name = "misato"
+version = "0.1.0"
+edition = "2024"
+description = "End-to-end Rust pipeline to find and extract Misato (and Rei + Asuka) from Neon Genesis Evangelion artbook page scans, by hair-class color clustering."
+
+[dependencies]
+image = "0.25"
+imageproc = "0.25"
+palette = "0.7"
+rayon = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+anyhow = "1.0"
+indicatif = { version = "0.17", features = ["rayon"] }
+csv = "1.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
