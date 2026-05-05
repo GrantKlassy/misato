@@ -18,24 +18,30 @@ mod connected;
 mod contact;
 mod extract;
 mod io;
+mod label;
 mod rank;
+mod tune;
+mod web;
 
 use crate::config::{Character, build_characters};
 use crate::extract::{ExtractConfig, extract_for_character};
 use crate::io::{Page, default_artbook_roots, enumerate_pages};
 use crate::rank::{
-    PageScore, RankConfig, group_by_character, rank_pages, write_per_character,
+    PageScore, RankConfig, ScoringWeights, group_by_character, rank_pages,
+    write_per_character,
 };
+use crate::tune::{TunedConfig, default_tuned_config_path};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Override artbook source root(s). Repeatable. Defaults to the four
-    /// NGE artbook directories under /mnt/smb/media/art.
+    /// NGE artbook directories under /media/starling/data/media/art.
     #[arg(long = "art-root")]
     art_roots: Vec<PathBuf>,
 
@@ -72,6 +78,27 @@ enum Command {
         top_n: usize,
         #[arg(long)]
         no_full_page: bool,
+    },
+    /// Pipeline 3: open a local web app to label pages as training data.
+    /// Reads `output/<char>/rankings.json` (must exist) and writes
+    /// `output/labels.json` as you click.
+    Label {
+        /// Address to bind the local server to.
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: String,
+    },
+    /// Pipeline 4: optimize per-character scoring weights against
+    /// `output/labels.json`. Writes `output/tuned_config.json`, which
+    /// subsequent `rank` invocations pick up automatically.
+    Tune,
+    /// Closed loop: rank → label (web app) → tune → re-rank. On exit from
+    /// the labeler, runs tune + re-rank automatically.
+    Loop {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: String,
+        /// Skip the initial rank if rankings.json already exists.
+        #[arg(long)]
+        skip_initial_rank: bool,
     },
 }
 
@@ -119,8 +146,52 @@ fn main() -> Result<()> {
             do_rank(&roots, &characters, &cli.out_dir)?;
             do_extract(&characters, &cli.out_dir, top_n, !no_full_page)?;
         }
+        Command::Label { bind } => {
+            web::serve(&cli.out_dir, &characters, &bind)?;
+        }
+        Command::Tune => {
+            tune::run_tune(&cli.out_dir, &characters)?;
+        }
+        Command::Loop { bind, skip_initial_rank } => {
+            do_loop(&roots, &characters, &cli.out_dir, &bind, skip_initial_rank)?;
+        }
     }
     Ok(())
+}
+
+/// Load tuned scoring weights from `output/tuned_config.json` if present.
+/// Returns an empty map if absent (= use defaults).
+fn load_tuned_weights(out_dir: &std::path::Path) -> BTreeMap<String, ScoringWeights> {
+    let path = default_tuned_config_path(out_dir);
+    if !path.exists() {
+        return BTreeMap::new();
+    }
+    match std::fs::File::open(&path)
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, TunedConfig>(f).ok())
+    {
+        Some(cfg) => {
+            println!(
+                "[rank] using tuned weights from {} ({} characters)",
+                path.display(),
+                cfg.weights.len()
+            );
+            for (k, d) in &cfg.diagnostics {
+                println!(
+                    "  {}: AUC default={:.3} tuned={:.3} (n_pos={}, n_neg={})",
+                    k, d.auc_default, d.auc_tuned, d.n_pos, d.n_neg
+                );
+            }
+            cfg.weights
+        }
+        None => {
+            eprintln!(
+                "[rank] warn: failed to load {}; using defaults",
+                path.display()
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 fn do_rank(
@@ -147,7 +218,8 @@ fn do_rank(
     );
 
     let _cfg = RankConfig::default();
-    let scores: Vec<PageScore> = rank_pages(&pages, characters, Some(&pb));
+    let weights = load_tuned_weights(out_dir);
+    let scores: Vec<PageScore> = rank_pages(&pages, characters, &weights, Some(&pb));
     pb.finish_with_message("ranking done");
 
     let grouped = group_by_character(scores);
@@ -226,6 +298,42 @@ fn do_extract(
             out_dir.join(&ch.key).join("index.html").display()
         );
     }
+    Ok(())
+}
+
+fn do_loop(
+    roots: &[PathBuf],
+    characters: &[Character],
+    out_dir: &PathBuf,
+    bind: &str,
+    skip_initial_rank: bool,
+) -> Result<()> {
+    let any_rankings_exist = characters
+        .iter()
+        .any(|c| out_dir.join(c.key).join("rankings.json").exists());
+    if !skip_initial_rank || !any_rankings_exist {
+        println!("\n=== loop step 1: initial rank ===");
+        do_rank(roots, characters, out_dir)?;
+    } else {
+        println!("\n=== loop step 1: skipping initial rank (existing rankings.json found) ===");
+    }
+
+    println!("\n=== loop step 2: label (Ctrl-C in the terminal to finish labeling and continue) ===");
+    web::serve(out_dir, characters, bind)?;
+
+    println!("\n=== loop step 3: tune from labels ===");
+    match tune::run_tune(out_dir, characters) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("[loop] tune failed: {}. skipping re-rank.", e);
+            return Ok(());
+        }
+    }
+
+    println!("\n=== loop step 4: re-rank with tuned weights ===");
+    do_rank(roots, characters, out_dir)?;
+
+    println!("\n=== loop done. Re-run `misato loop --skip-initial-rank` to label more. ===");
     Ok(())
 }
 

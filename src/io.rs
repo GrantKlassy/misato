@@ -57,18 +57,18 @@ fn is_image(path: &Path) -> bool {
     }
 }
 
-/// Default artbook roots from HUMAN.md.
+/// Default artbook roots.
 pub fn default_artbook_roots() -> Vec<PathBuf> {
     vec![
         PathBuf::from(
-            "/mnt/smb/media/art/Neon.Genesis.Evangelion.Artbook.-.Die.Sterne[GAINAX]",
+            "/media/starling/data/media/art/Neon.Genesis.Evangelion.Artbook.-.Die.Sterne[GAINAX]",
         ),
-        PathBuf::from("/mnt/smb/media/art/Neon Genesis Evangelion - Der Mond"),
+        PathBuf::from("/media/starling/data/media/art/Neon Genesis Evangelion - Der Mond"),
         PathBuf::from(
-            "/mnt/smb/media/art/Neon Genesis Evangelion - Groundwork of Evangelion Vol.1",
+            "/media/starling/data/media/art/Neon Genesis Evangelion - Groundwork of Evangelion Vol.1",
         ),
         PathBuf::from(
-            "/mnt/smb/media/art/Neon Genesis Evangelion - Groundwork of Evangelion Vol.2",
+            "/media/starling/data/media/art/Neon Genesis Evangelion - Groundwork of Evangelion Vol.2",
         ),
     ]
 }

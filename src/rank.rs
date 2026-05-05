@@ -28,6 +28,44 @@ pub const MAX_DIM: u32 = 1500;
 /// Smallest blob (in % of total pixels) that we'll treat as a real cluster.
 pub const MIN_BLOB_FRAC: f32 = 0.0008; // ~0.08% — about a head-sized region
 
+/// Tunable weights inside `combine_score`. Lifted out of literals so the
+/// label-driven tuner can search over them per character.
+///
+/// All defaults match the hand-tuned values that have been in production —
+/// see comments in `combine_score` for what each one does.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ScoringWeights {
+    pub blob_weight: f32,
+    pub mass_weight: f32,
+    pub mult_weight: f32,
+    pub secondary_weight: f32,
+    pub coupling_weight: f32,
+    pub density_floor: f32,
+    pub density_slope: f32,
+    pub aspect_log_div: f32,
+    pub coupling_cap: f32,
+    pub competition_floor: f32,
+    pub competition_slope: f32,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            blob_weight: 2.0,
+            mass_weight: 0.6,
+            mult_weight: 0.25,
+            secondary_weight: 0.3,
+            coupling_weight: 0.6,
+            density_floor: 0.4,
+            density_slope: 1.1,
+            aspect_log_div: 1.4,
+            coupling_cap: 0.15,
+            competition_floor: 0.25,
+            competition_slope: 0.75,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PageScore {
     pub book: String,
@@ -68,17 +106,22 @@ impl Default for RankConfig {
 /// Rank a list of pages for a list of characters. Returns one PageScore per
 /// (character, page). Internally parallelized — each page is loaded and
 /// scored once, then evaluated for every character (all share the downscale).
+///
+/// `weights_per_char` lets tuning override the default weights per character.
+/// Pass `&BTreeMap::new()` for defaults.
 pub fn rank_pages(
     pages: &[Page],
     characters: &[Character],
+    weights_per_char: &std::collections::BTreeMap<String, ScoringWeights>,
     progress: Option<&indicatif::ProgressBar>,
 ) -> Vec<PageScore> {
     let counter = AtomicUsize::new(0);
+    let default_w = ScoringWeights::default();
 
     let scores: Vec<Vec<PageScore>> = pages
         .par_iter()
         .map(|page| {
-            let res = score_page(page, characters);
+            let res = score_page(page, characters, weights_per_char, &default_w);
             let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(pb) = progress {
                 pb.set_position(n as u64);
@@ -100,7 +143,12 @@ pub fn rank_pages(
 /// We resolve by computing every character's primary signal up front, then
 /// during scoring we apply a multiplicative competition factor — if some
 /// other character has a much stronger hair blob on this page, demote.
-fn score_page(page: &Page, characters: &[Character]) -> anyhow::Result<Vec<PageScore>> {
+fn score_page(
+    page: &Page,
+    characters: &[Character],
+    weights_per_char: &std::collections::BTreeMap<String, ScoringWeights>,
+    default_w: &ScoringWeights,
+) -> anyhow::Result<Vec<PageScore>> {
     let img = ImageReader::open(&page.path)
         .with_context(|| format!("open {}", page.path.display()))?
         .with_guessed_format()?
@@ -184,6 +232,9 @@ fn score_page(page: &Page, characters: &[Character]) -> anyhow::Result<Vec<PageS
     for ((ch, p1), &mass_combined) in
         characters.iter().zip(pass1.iter()).zip(combined_mass.iter())
     {
+        let weights: &ScoringWeights = weights_per_char
+            .get(ch.key)
+            .unwrap_or(default_w);
         let largest = p1.blobs.first().map(|b| b.area).unwrap_or(0);
         let second = p1.blobs.get(1).map(|b| b.area).unwrap_or(0);
         let largest_density = p1.blobs.first().map(|b| b.density()).unwrap_or(0.0);
@@ -217,7 +268,9 @@ fn score_page(page: &Page, characters: &[Character]) -> anyhow::Result<Vec<PageS
         };
         // Both blob and mass must be competitive. We take the min and scale
         // into [0.25, 1.0] so a clear loser is heavily demoted.
-        let competition = (0.25 + 0.75 * (blob_share.min(mass_share))).min(1.0);
+        let competition =
+            (weights.competition_floor + weights.competition_slope * (blob_share.min(mass_share)))
+                .min(1.0);
 
         let certainty = combine_score(
             hair_pixel_ratio,
@@ -228,6 +281,7 @@ fn score_page(page: &Page, characters: &[Character]) -> anyhow::Result<Vec<PageS
             total_pixels,
             largest_density,
             largest_aspect,
+            weights,
         ) * competition;
 
         out.push(PageScore {
@@ -263,7 +317,7 @@ fn score_page(page: &Page, characters: &[Character]) -> anyhow::Result<Vec<PageS
 /// shape — compactness (area / bbox_area) and aspect ratio. A real head/hair
 /// region is roughly compact (>= 0.35 fill) and not extreme in aspect; a
 /// washed-out background of stray violet pixels is sparse and elongated.
-fn combine_score(
+pub fn combine_score(
     hair_pixel_ratio: f32,
     largest_blob_ratio: f32,
     blob_count: u32,
@@ -272,40 +326,46 @@ fn combine_score(
     total_pixels: u32,
     largest_density: f32,
     largest_aspect: f32,
+    w: &ScoringWeights,
 ) -> f32 {
     if largest_blob_ratio < 1e-6 && hair_pixel_ratio < 1e-5 {
         return 0.0;
     }
-    // Shape gate on the dominant blob:
-    //   density_factor in [0.4, 1.0]: ramps from 0.4 at density=0 to 1.0 at
-    //                                 density=0.55 (typical filled head).
-    //   aspect_factor in [0.5, 1.0]: penalize extreme aspect ratios.
-    let density_factor = (0.4 + largest_density * 1.1).min(1.0);
+    let density_factor = (w.density_floor + largest_density * w.density_slope).min(1.0);
     let aspect = if largest_aspect == 0.0 {
         1.0
     } else {
         let log_a = largest_aspect.ln().abs();
-        (1.0 - (log_a / 1.4).min(0.5)).max(0.5)
+        (1.0 - (log_a / w.aspect_log_div).min(0.5)).max(0.5)
     };
     let shape_factor = density_factor * aspect;
 
-    // Big-blob signal — log scale, capped. The dominant cue: a coherent
-    // hair-class cluster is much stronger evidence than scattered pixels.
-    let blob_term = (largest_blob_ratio * 1000.0).ln_1p() * 2.0 * shape_factor;
-    // Hair-mass signal.
-    let mass_term = (hair_pixel_ratio * 1000.0).ln_1p() * 0.6;
-    // Blob multiplicity (saturates at ~5 blobs).
-    let mult_term = (blob_count as f32).min(5.0).sqrt() * 0.25;
-    // Secondary co-occurrence — kept modest because Misato's jacket red is
-    // nearly indistinguishable from Asuka's plugsuit red, so secondary alone
-    // shouldn't dominate the score.
-    let secondary_term = (secondary_ratio * 1000.0).ln_1p() * 0.3;
-    // Coupling — secondary pixels near hair. Normalize by total pixels and
-    // cap the contribution so a giant Eva mech in red doesn't pump the score.
-    let coupling_ratio = (coupling_pixels as f32 / total_pixels as f32).min(0.15);
-    let coupling_term = (coupling_ratio * 1000.0).ln_1p() * 0.6;
+    let blob_term = (largest_blob_ratio * 1000.0).ln_1p() * w.blob_weight * shape_factor;
+    let mass_term = (hair_pixel_ratio * 1000.0).ln_1p() * w.mass_weight;
+    let mult_term = (blob_count as f32).min(5.0).sqrt() * w.mult_weight;
+    let secondary_term = (secondary_ratio * 1000.0).ln_1p() * w.secondary_weight;
+    let coupling_ratio = (coupling_pixels as f32 / total_pixels as f32).min(w.coupling_cap);
+    let coupling_term = (coupling_ratio * 1000.0).ln_1p() * w.coupling_weight;
 
     blob_term + mass_term + mult_term + secondary_term + coupling_term
+}
+
+/// Re-evaluate a `PageScore`'s certainty under different scoring weights,
+/// using only the cached scalar features (no image decode needed). This is
+/// what makes label-driven tuning fast: we're searching over weights, not
+/// re-running the pixel pipeline.
+pub fn rescore_with(score: &PageScore, w: &ScoringWeights, comp: f32) -> f32 {
+    combine_score(
+        score.hair_pixel_ratio,
+        score.largest_blob_ratio,
+        score.hair_blobs,
+        score.secondary_ratio,
+        score.coupling_pixels,
+        score.width * score.height,
+        score.largest_blob_density,
+        score.largest_blob_aspect,
+        w,
+    ) * comp
 }
 
 /// Sort scores descending by certainty, then by largest blob area.
